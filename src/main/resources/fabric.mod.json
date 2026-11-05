@@ -1,0 +1,27 @@
+{
+	"schemaVersion": 1,
+	"id": "survivalkit",
+	"version": "${version}",
+	"name": "SurvivalKit",
+	"description": "Client-side survival helper: auto eat, totem, tools and weapons, scaffold, vein breaking and world downloading.",
+	"authors": [
+		"merci"
+	],
+	"license": "MIT",
+	"icon": "assets/survivalkit/icon.png",
+	"environment": "client",
+	"entrypoints": {
+		"client": [
+			"com.merci.survivalkit.SurvivalKit"
+		]
+	},
+	"mixins": [
+		"survivalkit.mixins.json"
+	],
+	"depends": {
+		"fabricloader": ">=0.19.5",
+		"minecraft": "~26.3",
+		"java": ">=25",
+		"fabric-api": "*"
+	}
+}

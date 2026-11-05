@@ -1,0 +1,379 @@
+plugins {
+	id 'net.fabricmc.fabric-loom' version "${loom_version}"
+	id 'maven-publish'
+}
+
+fabricApi {
+	configureTests {
+		createSourceSet = true
+		modId = "survivalkit-gametest"
+		enableGameTests = false
+		enableClientGameTests = true
+	}
+}
+
+repositories {
+	// Add repositories to retrieve artifacts from in here.
+	// You should only use this when depending on other mods because
+	// Loom adds the essential maven repositories to download Minecraft and libraries from automatically.
+	// See https://docs.gradle.org/current/userguide/declaring_repositories.html
+	// for more information about repositories.
+}
+
+dependencies {
+	// To change the versions see the gradle.properties file
+	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+
+	// Fabric API. This is technically optional, but you probably want it anyway.
+	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+	testImplementation platform("org.junit:junit-bom:${project.junit_version}")
+	testImplementation "org.junit.jupiter:junit-jupiter"
+	testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+}
+
+tasks.named("test") {
+	useJUnitPlatform()
+	testLogging {
+		events "passed", "failed", "skipped"
+		exceptionFormat "short"
+	}
+}
+
+processResources {
+	def version = project.version
+	inputs.property "version", version
+
+	filesMatching("fabric.mod.json") {
+		expand "version": version
+	}
+}
+
+tasks.withType(JavaCompile).configureEach {
+	it.options.release = 25
+}
+
+java {
+	// Loom will automatically attach sourcesJar to a RemapSourcesJar task and to the "build" task
+	// if it is present.
+	// If you remove this line, sources will not be generated.
+	withSourcesJar()
+
+	sourceCompatibility = JavaVersion.VERSION_25
+	targetCompatibility = JavaVersion.VERSION_25
+}
+
+jar {
+	def projectName = project.name
+	inputs.property "projectName", projectName
+
+	from("LICENSE") {
+		rename { "${it}_$projectName"}
+	}
+}
+
+// configure the maven publication
+publishing {
+	publications {
+		create("mavenJava", MavenPublication) {
+			from components.java
+		}
+	}
+
+	// See https://docs.gradle.org/current/userguide/publishing_maven.html for information on how to set up publishing.
+	repositories {
+		// Add repositories to publish to here.
+		// Notice: This block does NOT have the same function as the block in the top level.
+		// The repositories here will be used for publishing your artifact, not for
+		// retrieving dependencies.
+	}
+}
+
+// ServerProfileGameTest starts a real dedicated server at localhost, which will not start without
+// the Minecraft EULA (https://aka.ms/MinecraftEULA) agreed. Agreed for the test run folders only,
+// at merci's say (2026-10-08); nothing outside build/run is touched.
+def gametestEula = "eula=true\n"
+
+// A hung client used to sit there until something else gave up; fail fast and loudly instead.
+tasks.named("runClientGameTest") {
+	// The whole suite ran past five minutes once Oto Silah joined it (about 5m 20s, every test
+	// passing); ten leaves room to grow while still failing a truly hung client.
+	timeout = java.time.Duration.ofMinutes(15)
+
+	// Other mods for the test client, to catch clashes a plain run cannot show:
+	// ./gradlew runClientGameTest -PextraMods=<folder of jars>. Point it at a copy of a
+	// profile's mods, never at the profile itself. The run folder is wiped each time, so
+	// dropping jars into its mods folder does not work.
+	if (project.hasProperty("extraMods")) {
+		jvmArgs "-Dfabric.addMods=${project.property("extraMods")}"
+	}
+
+	// The test client's options (src/gametest/options.txt) go into the freshly wiped run folder.
+	def runDir = layout.buildDirectory.dir("run/clientGameTest")
+	def options = layout.projectDirectory.file("src/gametest/options.txt")
+	doFirst {
+		def dir = runDir.get().asFile
+		dir.mkdirs()
+		new File(dir, "options.txt").bytes = options.asFile.bytes
+		new File(dir, "eula.txt").text = gametestEula
+	}
+}
+
+// The client gametest list the run actually gets. Two things happen to the copied fabric.mod.json:
+//
+// Only the client gametests you are working on: ./gradlew runClientGameTest -Pgametests=AutoEat,Totem
+// Fabric has no filter of its own, so the list keeps just the entrypoints whose class name contains
+// one of the words (case-insensitive). For development only: merging and installing still need the
+// full, unfiltered run.
+//
+// And GameTestBoundary goes before every test and after the last: it puts every module back to its
+// defaults, so no test depends on the one before it, and logs each test's duration.
+tasks.named("processGametestResources") {
+	def words = (providers.gradleProperty("gametests").orNull ?: "")
+		.split(",").collect { it.trim().toLowerCase(Locale.ROOT) }.findAll { it }
+	inputs.property("gametests", words.join(","))
+
+	def modJson = new File(destinationDir, "fabric.mod.json")
+	def boundary = "com.merci.survivalkit.gametest.GameTestBoundary"
+	doLast {
+		def json = new groovy.json.JsonSlurper().parse(modJson, "UTF-8")
+		def all = json.entrypoints["fabric-client-gametest"]
+		def kept = all.findAll { cls ->
+			def name = cls.substring(cls.lastIndexOf('.') + 1).toLowerCase(Locale.ROOT)
+			words.isEmpty() || words.any { name.contains(it) }
+		}
+		if (kept.isEmpty()) {
+			throw new GradleException("-Pgametests=${words.join(",")} matches no client gametest")
+		}
+		json.entrypoints["fabric-client-gametest"] = kept.collectMany { [boundary, it] } + [boundary]
+		modJson.setText(groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(json)), "UTF-8")
+		if (words) {
+			logger.lifecycle("Client gametests (${kept.size()}/${all.size()}): ${kept.collect { it.substring(it.lastIndexOf('.') + 1) }.join(", ")}")
+		}
+	}
+}
+
+// The same client gametests, dealt out to several clients that run side by side, each in its own
+// run folder: ./gradlew runClientGameTestParallel (-Pworkers=N, default below; -Pgametests works too).
+//
+// The tests are dealt longest first, each to the client with the least work so far, by the seconds
+// in src/gametest/sureler.properties — measured, not guessed: every run logs each test's duration
+// (GameTestBoundary), and -PsureleriKaydet writes this run's into that file. A test not in it yet
+// counts as the average.
+//
+// One summary at the end. If any client fails the run fails, and that client's log, output and
+// screenshots are copied to build/gametest-dusen/ so the next run, which wipes the run folders,
+// cannot take them away.
+static void copyTree(File from, File to) {
+	if (from.isDirectory()) {
+		from.eachFileRecurse(groovy.io.FileType.FILES) { file ->
+			def target = new File(to, from.toPath().relativize(file.toPath()).toString())
+			target.parentFile.mkdirs()
+			target.bytes = file.bytes
+		}
+	} else {
+		to.parentFile.mkdirs()
+		to.bytes = from.bytes
+	}
+}
+
+tasks.register("runClientGameTestParallel") {
+	group = "fabric"
+	description = "Runs the client gametests on several clients at once, balanced by measured durations."
+	dependsOn "classes", "gametestClasses", "processResources", "processGametestResources", "configureLaunch"
+	notCompatibleWithConfigurationCache("starts and watches several game clients itself")
+
+	doLast {
+		def serial = tasks.named("runClientGameTest").get()
+		def buildDir = layout.buildDirectory.get().asFile
+		def gametestResources = new File(buildDir, "resources/gametest")
+		def modJson = new File(gametestResources, "fabric.mod.json")
+		def options = file("src/gametest/options.txt")
+		def timesFile = file("src/gametest/sureler.properties")
+		def boundary = "com.merci.survivalkit.gametest.GameTestBoundary"
+		def shortName = { String cls -> cls.substring(cls.lastIndexOf('.') + 1) }
+
+		def json = new groovy.json.JsonSlurper().parse(modJson, "UTF-8")
+		List<String> tests = json.entrypoints["fabric-client-gametest"].findAll { it != boundary }
+
+		def times = new Properties()
+		if (timesFile.exists()) {
+			timesFile.withReader("UTF-8") { times.load(it) }
+		}
+		def known = times.values().collect { it as double }
+		double average = known ? known.sum() / known.size() : 10
+		def seconds = { String cls -> (times.getProperty(shortName(cls)) ?: average) as double }
+
+		// 4 on the i7-13620H / 32 GB laptop: 2 took 314s, 3 took 219s, 4 took 186-197s with 5.5 GB
+		// still free. 5 took 165s but left 3.5 GB and one AutoWeapon hit read too early, so it is
+		// opt-in (-Pworkers=5).
+		int workers = (providers.gradleProperty("workers").orNull ?: "4") as int
+		workers = Math.max(1, Math.min(workers, tests.size()))
+		def shards = (0..<workers).collect { [id: it, tests: [], seconds: 0d] }
+		tests.sort(false) { -seconds(it) }.each { cls ->
+			def lightest = shards.min { it.seconds }
+			lightest.tests << cls
+			lightest.seconds += seconds(cls)
+		}
+
+		logger.lifecycle("${tests.size()} client gametests on ${workers} clients:")
+		shards.each { s ->
+			logger.lifecycle("  [${s.id}] ~${Math.round(s.seconds)}s: ${s.tests.collect(shortName).join(", ")}")
+		}
+
+		// The serial task's own launch: its JVM arguments and classpath, with this shard's
+		// fabric.mod.json in place of the full one.
+		def javaExe = serial.javaLauncher.get().executablePath.asFile.absolutePath
+		// Loom's own @argFile holds the serial run's classpath and only exists once that task has
+		// run, so a fresh worktree failed every client on it; each shard brings its own instead.
+		def jvmArgs = serial.allJvmArgs.findAll { !it.startsWith("@") }
+		def mainClass = serial.mainClass.get()
+		def classpath = serial.classpath.files
+		def args = serial.args
+
+		def started = System.nanoTime()
+		def running = Collections.synchronizedList([])
+		def pool = java.util.concurrent.Executors.newFixedThreadPool(shards.size())
+		def results
+		try {
+			def futures = shards.collect { shard ->
+				pool.submit({
+					def runDir = new File(buildDir, "run/clientGameTest-${shard.id}")
+					runDir.deleteDir()
+					runDir.mkdirs()
+					new File(runDir, "options.txt").bytes = options.bytes
+					new File(runDir, "eula.txt").text = gametestEula
+
+					def resources = new File(buildDir, "resources/gametest-${shard.id}")
+					resources.deleteDir()
+					copyTree(gametestResources, resources)
+					def shardJson = new groovy.json.JsonSlurper().parse(modJson, "UTF-8")
+					shardJson.entrypoints["fabric-client-gametest"] = shard.tests.collectMany { [boundary, it] } + [boundary]
+					new File(resources, "fabric.mod.json").setText(groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(shardJson)), "UTF-8")
+
+					def argFile = new File(runDir, "classpath.args")
+					def cp = classpath.collect { it == gametestResources ? resources : it }*.absolutePath.join(File.pathSeparator)
+					argFile.setText("-cp\n\"" + cp.replace("\\", "\\\\") + "\"\n", "UTF-8")
+
+					def process = new ProcessBuilder([javaExe] + jvmArgs + ["@" + argFile.absolutePath, mainClass] + args)
+						.directory(runDir)
+						.redirectErrorStream(true)
+						.start()
+					running << process
+
+					// No test takes five minutes (the longest about one), so a client that finishes
+					// none for that long is stuck. Its threads are dumped to stuck-threads.txt before
+					// it is stopped, so the next look at a hang does not start from nothing.
+					def lastProgress = new java.util.concurrent.atomic.AtomicLong(System.nanoTime())
+					def stuck = new java.util.concurrent.atomic.AtomicBoolean()
+					Thread.startDaemon("gametest-watchdog-${shard.id}") {
+						while (process.isAlive()) {
+							Thread.sleep(5000)
+							if (System.nanoTime() - lastProgress.get() > java.util.concurrent.TimeUnit.MINUTES.toNanos(5)) {
+								stuck.set(true)
+								def dump = new File(runDir, "stuck-threads.txt")
+								def jcmd = new File(new File(javaExe).parentFile, "jcmd" + (javaExe.endsWith(".exe") ? ".exe" : ""))
+								try {
+									def p = new ProcessBuilder(jcmd.absolutePath, "${process.pid()}", "Thread.print")
+										.redirectErrorStream(true).redirectOutput(dump).start()
+									p.waitFor(30, java.util.concurrent.TimeUnit.SECONDS)
+								} catch (Exception e) {
+									dump.text = "jcmd failed: ${e}"
+								}
+								process.destroyForcibly()
+								break
+							}
+						}
+					}
+
+					def output = new File(runDir, "cikti.log")
+					def durations = [:]
+					String current = null
+					boolean inError = false
+					output.withWriter("UTF-8") { out ->
+						process.inputStream.newReader("UTF-8").eachLine { line ->
+							out.writeLine(line)
+							def took = line =~ /\[gametest-süre\] (\S+) ([\d.]+)/
+							def starts = line =~ /\[gametest-başla\] (\S+)/
+							if (took.find()) {
+								durations[took.group(1)] = took.group(2) as double
+								current = null
+								lastProgress.set(System.nanoTime())
+							} else if (starts.find()) {
+								current = starts.group(1)
+								lastProgress.set(System.nanoTime())
+							}
+							// The console gets the tests' own lines and the test thread's errors with their
+							// stack; the rest (the offline sign-in noise included) stays in cikti.log.
+							if (line.startsWith("[")) {
+								inError = line.contains("Test thread/ERROR")
+							}
+							if (line.contains("[gametest") || inError) {
+								logger.lifecycle("[${shard.id}] ${line}")
+							}
+						}
+					}
+					boolean finished = process.waitFor(15, java.util.concurrent.TimeUnit.MINUTES)
+					if (!finished) {
+						process.destroyForcibly()
+					}
+					// A client that stops early is a failure whatever its exit code: one once stuck
+					// leaving ToolPairsGameTest's world, then exited 0 minutes later with no test finished.
+					int exit = finished ? process.exitValue() : -1
+					if (stuck.get()) {
+						exit = -3
+					} else if (exit == 0 && durations.size() < shard.tests.size()) {
+						exit = -2
+					}
+					[shard: shard, runDir: runDir, exit: exit,
+					 timedOut: !finished, failedTest: current, durations: durations]
+				} as java.util.concurrent.Callable)
+			}
+			results = futures*.get()
+		} finally {
+			running.each { it.destroyForcibly() }
+			pool.shutdownNow()
+		}
+		long total = Math.round((System.nanoTime() - started) / 1e9)
+
+		def failed = results.findAll { it.exit != 0 }
+		logger.lifecycle("")
+		logger.lifecycle("==== Client gametests, ${workers} clients, ${total}s ====")
+		results.each { r ->
+			long took = Math.round(r.durations.values().sum(0d))
+			String status = r.exit == 0 ? "PASSED"
+				: (r.timedOut ? "TIMED OUT" : r.exit == -3 ? "STUCK 5 MIN" : r.exit == -2 ? "STOPPED EARLY" : "FAILED") + (r.failedTest ? " in ${r.failedTest}" : "")
+			logger.lifecycle("  [${r.shard.id}] ${status}: ${r.durations.size()}/${r.shard.tests.size()} tests, ${took}s in tests")
+		}
+
+		def kept = new File(buildDir, "gametest-dusen/" + new Date().format("yyyyMMdd-HHmmss"))
+		failed.each { r ->
+			def dir = new File(kept, "${r.shard.id}")
+			["logs/latest.log", "cikti.log", "stuck-threads.txt", "screenshots"].each { path ->
+				def from = new File(r.runDir, path)
+				if (from.exists()) {
+					copyTree(from, new File(dir, path))
+				}
+			}
+			logger.error("  [${r.shard.id}] log and screenshots kept in ${dir}")
+		}
+
+		if (providers.gradleProperty("sureleriKaydet").isPresent() && !failed) {
+			def measured = new TreeMap<String, String>()
+			times.each { k, v -> measured[k as String] = v as String }
+			results.each { r -> r.durations.each { k, v -> measured[k] = String.format(Locale.ROOT, "%.1f", v) } }
+			timesFile.withWriter("UTF-8") { out ->
+				out.writeLine("# Seconds each client gametest took, from a parallel run (-PsureleriKaydet).")
+				out.writeLine("# runClientGameTestParallel deals the tests out by these; a missing test counts as the average.")
+				measured.each { k, v -> out.writeLine("${k}=${v}") }
+			}
+			logger.lifecycle("  durations written to ${timesFile}")
+		}
+
+		if (failed) {
+			throw new GradleException("${failed.size()} of ${workers} gametest clients failed: " +
+				failed.collect { "[${it.shard.id}] ${it.failedTest ?: '?'}" }.join(", "))
+		}
+	}
+}

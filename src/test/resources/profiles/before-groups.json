@@ -1,0 +1,49 @@
+{
+  "autoeat": {
+    "enabled": true,
+    "key": "key.keyboard.j",
+    "threshold_mode": "auto",
+    "threshold": 12,
+    "eat_early_when_hurt": true,
+    "early_eating_health": 10,
+    "priority": [
+      "minecraft:bread",
+      "minecraft:cooked_beef"
+    ],
+    "blocked": [
+      "minecraft:rotten_flesh"
+    ],
+    "fallback": "lowest_value_first",
+    "golden_apple": true,
+    "enchanted_golden_apple": true,
+    "health_threshold": 5,
+    "scope": "full",
+    "return_to_slot": false,
+    "eating_hand": "off_hand",
+    "keep_offhand_totem": false
+  },
+  "autototem": {
+    "enabled": true,
+    "key": "key.keyboard.h",
+    "scope": "full",
+    "mode": "health_threshold",
+    "health_threshold": 6,
+    "restore_offhand": false,
+    "fallback": [
+      "minecraft:shield"
+    ],
+    "warn_when_out": false,
+    "action_bar": true
+  },
+  "wdl": {
+    "enabled": true,
+    "key": "key.keyboard.g",
+    "continue_world": false,
+    "seed": "12345",
+    "auto_query_seed": false,
+    "ownership": "transfer_to_local",
+    "flush_interval": 60,
+    "save_player_state": false,
+    "action_bar": true
+  }
+}
